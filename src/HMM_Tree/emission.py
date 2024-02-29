@@ -122,21 +122,17 @@ class EmissionAlphabetDistribution(EmissionDiscreteDistribution):
         dprobs = params['probabilities']
         views = []
         views.append(SharedMemory(smm_map['tree_seqs']))
-        probs = numpy.ndarray(seqN, dtype=numpy.int32,
-                              buffer=views[-1].buf)
+        tree_seqs = numpy.ndarray(seqN, dtype=numpy.int32,
+                                  buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['tree_probs']))
         probs = numpy.ndarray(probsShape, dtype=numpy.float64,
                               buffer=views[-1].buf)
-        views.append(SharedMemory(smm_map['tree_scores']))
-        scores = numpy.ndarray((seqN, 2), dtype=numpy.float64,
-                               buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['log_total']))
         log_total = numpy.ndarray(totalShape, dtype=numpy.float64,
                                   buffer=views[-1].buf)
-        tallies = numpy.sum(numpy.exp(
-            probs[start:end, state_idx, :, 3].reshape(-1, 1, num_nodes) +
-            log_total[tree_seqs[start:end], :, :] +
-            scores[start:end, 0].reshape(-1, 1, 1)), axis=0) 
+        tallies = numpy.sum(numpy.sum(
+            probs[start:end, state_idx, :, 4].reshape(-1, 1, num_nodes) +
+            total[tree_seqs[start:end], :, :], axis=2), axis=0)
         for V in views:
             V.close()
         return state_idx, tallies
@@ -403,9 +399,6 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
         views.append(SharedMemory(smm_map['total']))
         total = numpy.ndarray(probsShape, dtype=numpy.float64,
                               buffer=views[-1].buf)
-        views.append(SharedMemory(smm_map['obs_scores']))
-        obs_scores = numpy.ndarray((obs_indices.shape[0] - 1, num_nodes, 2),
-                                   dtype=numpy.float64, buffer=views[-1].buf)
         names = obsDtype.names
         tallies = numpy.zeros(3, numpy.float64)
         if mix_idx is None:
@@ -413,15 +406,12 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
                 s, e = obs_indices[i:i+2]
                 tallies[0] += numpy.sum(
                     obs[names[dist_idx]][s:e] *
-                    total[s:e, state_idx, node_idx] *
-                    numpy.exp(obs_scores[i, node_idx, 0]))
+                    total[s:e, state_idx, node_idx])
                 tallies[1] += numpy.sum(
                     (obs[names[dist_idx]][s:e] - mu) ** 2 *
-                    total[s:e, state_idx, node_idx] *
-                    numpy.exp(obs_scores[i, node_idx, 0]))
+                    total[s:e, state_idx, node_idx])
                 tallies[2] += numpy.sum(
-                    total[s:e, state_idx, node_idx] *
-                    numpy.exp(obs_scores[i, node_idx, 0]))
+                    total[s:e, state_idx, node_idx])
         else:
             index, mixN = params[-2:]
             views.append(SharedMemory(smm_map['mix_probs']))

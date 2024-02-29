@@ -64,16 +64,14 @@ class TransitionMatrix():
         views.append(SharedMemory(smm_map['scale']))
         scale = numpy.ndarray((obsN, num_nodes), dtype=numpy.float64,
                               buffer=views[-1].buf)
-        views.append(SharedMemory(smm_map['obs_scores']))
-        obs_scores = numpy.ndarray((obsN, num_nodes, 2), dtype=numpy.float64,
-                                   buffer=views[-1].buf)
         tallies = numpy.zeros(valid_trans[0].shape[0], numpy.float64)
         for i in range(start, end):
             s, e = obs_indices[i:i+2]
             xi = numpy.exp(forward[s:e - 1, valid_trans[0], idx] +
                            reverse[s + 1:e, valid_trans[1], idx] +
                            probs[s + 1:e, valid_trans[1], idx] +
-                           transitions.reshape(1, -1) + obs_scores[i, idx, 0])
+                           transitions.reshape(1, -1) + scale[s + 1:e, idx])
+            xi /= numpy.sum(xi, axis=1, keepdims=True)
             tallies += numpy.sum(xi, axis=0)
         for V in views:
             V.close()
@@ -90,8 +88,6 @@ class TransitionMatrix():
         views.append(SharedMemory(smm_map['tree_scale']))
         scale = numpy.ndarray(obsN, dtype=numpy.float64,
                               buffer=views[-1].buf)
-        views.append(SharedMemory(smm_map['tree_scores']))
-        scores = numpy.ndarray((seqN, 2), dtype=numpy.float64, buffer=views[-1].buf)
         tallies = numpy.zeros((num_states, num_states), numpy.float64)
         for idx1, idx2 in pairs:
             children = node_children[idx2]
@@ -105,8 +101,8 @@ class TransitionMatrix():
                            numpy.sum(probs[s:e, :, children, 1], axis=2))
             xi = numpy.exp(probs[s:e, :, idx1, 2].reshape(-1, num_states, 1) +
                            reverse.reshape(-1, 1, num_states) +
-                           transitions.reshape(1, num_states, num_states) +
-                           scores[s:e, 0].reshape(-1, 1, 1))
+                           transitions.reshape(1, num_states, num_states))
+            xi /= numpy.sum(numpy.sum(xi, axis=2), axis=1).reshape(-1, 1, 1)
             tallies += numpy.sum(xi, axis=0)
         for V in views:
             V.close()

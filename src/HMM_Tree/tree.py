@@ -102,7 +102,9 @@ class Tree():
         else:
             parents = tree
         # Add nodes and connections
+        node_order = []
         for c, p in parents.items():
+            node_order.append(c)
             if p not in self.nodes and p is not None:
                 self.node_index[p] = len(self.nodes)
                 self.nodes[p] = Node(p, self.node_index[p])
@@ -129,7 +131,8 @@ class Tree():
                 raise RuntimeError("Not all nodes are in a single tree")
         # Figure out order to evaluate nodes in
         levels = {}
-        for name, n in self.nodes.items():
+        for name in node_order:
+            n = self.nodes[name]:
             l = n.level
             levels.setdefault(l, [])
             levels[l].append(name)
@@ -272,7 +275,6 @@ class Tree():
         self.clear_tallies()
         for node in self.nodes:
             self.update_node_model(node)
-        self.obs_scores[:, :, 0] -= numpy.amax(self.obs_scores[:, :, 0])
         for node in self.nodes:
             self.update_node_tallies(node)
         self.apply_node_tallies()
@@ -500,8 +502,7 @@ class Tree():
 
     def update_tallies(self):
         self.log_probs[-1] = numpy.sum(self.tree_scores[:, 1])
-        self.initial_probabilities.update_tallies(numpy.exp(
-            self.tree_probs[:, :, 3] + self.tree_scores[:, 0].reshape(-1, 1)))
+        self.initial_probabilities.update_tallies(self.tree_probs[:, :, 4])
         self.update_transition_tallies()
         self.update_emission_tallies()
         return
@@ -586,13 +587,14 @@ class Tree():
             if len(children_idxs) > 0:
                 probs[start:end, :, i, 1] = (numpy.sum(
                     probs[start:end, :, children_idxs, 1], axis=2) +
-                    probs[start:end, :, i, 1])
+                    probs[start:end, :, i, 0])
             else:
                 probs[start:end, :, i, 1] = probs[start:end, :, i, 0]
             probs[start:end, :, i, 1] = scipy.special.logsumexp(
                 probs[start:end, :, i, 1].reshape(-1, 1, num_states) + 
                 transitions.reshape(1, num_states, num_states), axis=2)
-            scale[start:end, i] = numpy.amax(probs[start:end, :, i, 1], axis=1)
+            scale[start:end, i] = scipy.special.logsumexp(
+                probs[start:end, :, i, 1], axis=1)
             probs[start:end, :, i, 1] -= scale[start:end, i].reshape(-1, 1)
         for V in views:
             V.close()
@@ -600,7 +602,7 @@ class Tree():
 
     @classmethod
     def find_forward_thread(self, *args):
-        (start, end, initprobs, transitions, node_parents, node_cihldren,
+        (start, end, initprobs, transitions, node_parents, node_children,
          probs_shape, node_order, smm_map) = args
         seqN, num_states, num_nodes, _ = probs_shape
         views = []
@@ -613,7 +615,8 @@ class Tree():
             if parent_idx is None:
                 probs[start:end, :, i, 2] = (initprobs.reshape(1, -1) +
                                              probs[start:end, :, i, 0])
-                scale[start:end, i] = numpy.amax(probs[start:end, :, i, 2])
+                scale[start:end, i] = scipy.special.logsumexp(
+                    probs[start:end, :, i, 2], axis=1)
                 probs[start:end, :, i, 2] -= scale[start:end, i].reshape(-1, 1)
             elif len(node_children[parent_idx]) == 1:
                 probs[start:end, :, i, 2] = (scipy.special.logsumexp(
@@ -638,7 +641,7 @@ class Tree():
 
     @classmethod
     def find_total_thread(self, *args):
-        s, e, node_cihldren, probs_shape, node_order, smm_map = args
+        s, e, node_children, probs_shape, node_order, smm_map = args
         seqN, num_states, num_nodes, _ = probs_shape
         views = []
         views.append(SharedMemory(smm_map['tree_probs']))
@@ -655,15 +658,15 @@ class Tree():
             else:
                 probs[s:e, :, i, 3] = probs[s:e, :, i, 2] + numpy.sum(
                     probs[s:e, :, children, 1], axis=2)
+        tmp = scipy.special.logsumexp(probs[s:e, :, :, 3], axis=1)
+        probs[s:e, :, :, 3] -= tmp.reshape(-1, 1, num_nodes)
 
-        probs[s:e, :, :, 4] = numpy.exp(probs[s:e, :, :, 3] - numpy.amax(
-            probs[s:e, :, :, 3], axis=1, keepdims=True))
+        probs[s:e, :, :, 4] = numpy.exp(probs[s:e, :, :, 3])
         probs[s:e, :, :, 4] /= numpy.sum(probs[s:e, :, :, 4], axis=1,
                                              keepdims=True)
         root = node_order[0]
         scores[s:e, 0] = numpy.sum(tree_scale[s:e, :], axis=1)
-        scores[s:e, 1] = (scipy.special.logsumexp(probs[s:e, root, :, 3], axis=1) +
-                          scores[s:e, 0])
+        scores[s:e, 1] = numpy.sum(tmp[:, root]) + scores[s:e, 0]
         for V in views:
             V.close()
         return
@@ -680,9 +683,10 @@ class Tree():
                                      buffer=views[-1].buf)
         tree_weights[start:end, :].fill(0)
         for i in range(num_tree_states):
-            tree_weights[start:end, :] += (tree_probs[start:end, i, :] *
+            tree_weights[start:end, :] += (tree_probs[start:end, i, :, 4] *
                                            emissions[i].probabilities.reshape(1, -1))
-        tree_weights[start:end, :] /= numpy.sum(tree_probs[start:end, :, :], axis=1)
+        tree_weights[start:end, :] /= numpy.sum(tree_weights[start:end, :],
+                                                axis=1, keepdims=True)
         tree_weights[start:end, :] = numpy.log(tree_weights[start:end, :])
         for V in views:
             V.close()

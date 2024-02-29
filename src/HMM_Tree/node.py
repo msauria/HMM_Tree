@@ -167,15 +167,10 @@ class Node():
         probs_shape, obs_indices, smm_map = args
         obsN, num_states, num_nodes = probs_shape
         views = []
-        views.append(SharedMemory(smm_map['log_total']))
-        probs = numpy.ndarray(probs_shape, dtype=numpy.float64,
+        views.append(SharedMemory(smm_map['total']))
+        total = numpy.ndarray(probs_shape, dtype=numpy.float64,
                               buffer=views[-1].buf)
-        views.append(SharedMemory(smm_map['obs_scores']))
-        obs_scores = numpy.ndarray((obs_indices.shape[0] - 1, num_nodes, 2),
-                                   dtype=numpy.float64, buffer=views[-1].buf)
-        self.initial_probabilities.update_tallies(numpy.exp(
-            probs[obs_indices[:-1], :, self.index] +
-            obs_scores[:, self.index, 0].reshape(-1, 1)))
+        self.initial_probabilities.update_tallies(total[obs_indices[:-1], :, self.index])
         return
 
     def apply_tallies(self):
@@ -317,10 +312,10 @@ class Node():
             s, e = obs_indices[i:i+2]
             forward[s, :, node_idx] = node.initial_probabilities[:] + probs[s, :, node_idx]
             scale[s, node_idx] = scipy.special.logsumexp(forward[s, :, node_idx])
-            forward[s, :, node_idx] -= scale[s]
+            forward[s, :, node_idx] -= scale[s, node_idx]
             for j in range(s + 1, e):
                 tmp[valid_trans] = (forward[j - 1, valid_trans[0], node_idx] +
-                                    transitions)
+                                    transitions + probs[j, valid_trans[1], node_idx])
                 forward[j, :, node_idx] = (scipy.special.logsumexp(tmp, axis=0) +
                                            probs[j, :, node_idx])
                 scale[j, node_idx] = scipy.special.logsumexp(forward[j, :, node_idx])
