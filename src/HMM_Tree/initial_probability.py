@@ -9,18 +9,21 @@ class InitialProbability():
         assert (num_states is not None) != (initial_probabilities is not None)
         if num_states is not None:
             RNG = numpy.random.default_rng(seed)
-            self.initial_probabilities = RNG.rand(size=num_states).astype(numpy.float64)
+            self.initial_probabilities = RNG.random(size=num_states).astype(numpy.float64)
             self.initial_probabilities /= numpy.sum(self.initial_probabilities)
             self.initial_mapping = numpy.arange(num_states)
         else:
             self.initial_probabilities = initial_probabilities.astype(numpy.float64)
+            num_states = self.initial_probabilities.shape[0]
             if initial_mapping is not None:
                 self.initial_mapping = initial_mapping.astype(numpy.int32)
                 self.initial_probabilities[numpy.where(self.initial_mapping < 0)[0]] = 0
+            else:
+                self.initial_mapping = numpy.arange(num_states)
         self.initial_probabilities /= numpy.sum(self.initial_probabilities)
-        self.log_initprobs = numpy.full(num_states, -numpy.inf, numpy.float64)
+        self.initial_logprobs = numpy.full(num_states, -numpy.inf, numpy.float64)
         where = numpy.where(self.initial_probabilities > 0)[0]
-        self.log_initprobs[where] = numpy.log(self.initial_probabilities[where])
+        self.initial_logprobs[where] = numpy.log(self.initial_probabilities[where])
         self.updated = False
         self.tallies = numpy.zeros(self.initial_probabilities.shape[0], numpy.float64)
         return
@@ -47,7 +50,7 @@ class InitialProbability():
         self.updated = True
         where = numpy.where(self.initial_mapping >= 0)[0]
         tmp = numpy.bincount(self.initial_mapping[where],
-                             weights=self.tallies)
+                             weights=self.tallies[where])
         tmp /= numpy.maximum(numpy.bincount(self.initial_mapping[where]), 1)
         self.initial_probabilities.fill(0)
         self.initial_probabilities[where] = tmp[self.initial_mapping[where]]

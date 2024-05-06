@@ -22,7 +22,7 @@ class EmissionDistribution():
 
     @classmethod
     def update_tallies(self, *args):
-        func = args[8]
+        func = args[0]
         return func(*args)
 
     def print(self, level=0):
@@ -64,7 +64,7 @@ class EmissionAlphabetDistribution(EmissionDiscreteDistribution):
     def score_observations(self, obs, **kwargs):
         start = kwargs['start']
         end = kwargs['end']
-        if issubclass(obs.dtype, numpy.integer):
+        if issubclass(obs.dtype.type, numpy.integer):
             if 'nonlog' in kwargs:
                 probs = self.probabilities[obs[start:end]]
             else:
@@ -80,13 +80,16 @@ class EmissionAlphabetDistribution(EmissionDiscreteDistribution):
                 probs[where2] = -numpy.inf
         return probs
 
-    def get_parameters(self):
-        return {"probabilities": self.log_probs}
+    def get_parameters(self, log=True):
+        if log:
+            return {"probabilities": self.log_probs}
+        else:
+            return {"probabilities": self.probabilities}
 
     @classmethod
     def update_tallies(self, *args):
-        (start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, func, params, smm_map) = args
+        (func, start, end, state_idx, dist_idx, mix_idx,
+         obsDtype, probsShape, params, smm_map) = args
         obsN = probsShape[0]
         dprobs = params['probabilities']
         views = []
@@ -115,7 +118,7 @@ class EmissionAlphabetDistribution(EmissionDiscreteDistribution):
 
     @classmethod
     def update_tree_tallies(self, *args):
-        (start, end, state_idx, totalShape, probsShape, func, params,
+        (func, start, end, state_idx, totalShape, probsShape, params,
          smm_map) = args
         seqN, num_states, num_nodes, _ = probsShape
         obsN, num_node_states, num_nodes = totalShape
@@ -127,11 +130,11 @@ class EmissionAlphabetDistribution(EmissionDiscreteDistribution):
         views.append(SharedMemory(smm_map['tree_probs']))
         probs = numpy.ndarray(probsShape, dtype=numpy.float64,
                               buffer=views[-1].buf)
-        views.append(SharedMemory(smm_map['log_total']))
-        log_total = numpy.ndarray(totalShape, dtype=numpy.float64,
+        views.append(SharedMemory(smm_map['total']))
+        total = numpy.ndarray(totalShape, dtype=numpy.float64,
                                   buffer=views[-1].buf)
         tallies = numpy.sum(numpy.sum(
-            probs[start:end, state_idx, :, 4].reshape(-1, 1, num_nodes) +
+            probs[start:end, state_idx, :, 4].reshape(-1, 1, num_nodes) *
             total[tree_seqs[start:end], :, :], axis=2), axis=0)
         for V in views:
             V.close()
@@ -148,7 +151,7 @@ class EmissionAlphabetDistribution(EmissionDiscreteDistribution):
         return
 
     def print(self, level=0):
-        tmp = " ".join([f"{numpy.exp(x)}:{self.probabilities[x] * 100:0.1f}%" for x in range(self.alphabet_size)])
+        tmp = " ".join([f"{x}:{self.probabilities[x] * 100:0.1f}%" for x in range(self.alphabet_size)])
         return f"{' '*level}Alphabet-{self.index} {self.label}\n      {tmp}"
 
     def generate_emission(self, RNG=None):
@@ -156,6 +159,42 @@ class EmissionAlphabetDistribution(EmissionDiscreteDistribution):
             return numpy.searchsorted(numpy.cumsum(self.probabilities), numpy.random.random())
         else:
             return numpy.searchsorted(numpy.cumsum(self.probabilities), RNG.random())
+
+
+class EmissionSummingDistribution(EmissionDiscreteDistribution):
+    """Summing-based hmm emission distribution"""
+
+    def __init__(self, probabilities=None, RNG=None, fixed=False, label=""):
+        self.name = "Summing"
+        self.probabilities = probabilities.astype(numpy.float64)
+        self.log_probs = numpy.full(self.probabilities.shape, -numpy.inf,
+                                    numpy.float64)
+        where = numpy.where(self.probabilities > 0)[0]
+        self.log_probs[where] = numpy.log(self.probabilities[where])
+        self.label = label
+        self.fixed = True
+
+    def score_observations(self, obs, **kwargs):
+        start = kwargs['start']
+        end = kwargs['end']
+        shape = [1 for x in range(len(obs.shape))]
+        shape[1] = self.probabilities.shape[0]
+        # probs = numpy.sum(obs[start:end] * self.probabilities.reshape(shape),
+        #                   axis=1)
+        # where = numpy.where(probs > 0)
+        # where2 = numpy.where(probs == 0)
+        # probs[where] = numpy.log(probs[where])
+        # probs[where2] = -numpy.inf
+        probs = scipy.special.logsumexp(obs[start:end] + self.log_probs.reshape(shape), axis=1)
+        return probs
+
+    def print(self, level=0):
+        tmp = " ".join([f"{x}:{self.probabilities[x] * 100:0.1f}%"
+                        for x in range(self.probabilities.shape[0])])
+        return f"{' '*level}Summing-{self.index} {self.label}\n      {tmp}"
+
+    def get_parameters(self, **kwargs):
+        return {"probabilities": self.probabilities}
 
 
 class EmissionPoissonDistribution(EmissionDiscreteDistribution):
@@ -199,8 +238,8 @@ class EmissionPoissonDistribution(EmissionDiscreteDistribution):
 
     @classmethod
     def update_tallies(self, *args):
-        (start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, func, params, smm_map) = args
+        (func, start, end, state_idx, dist_idx, mix_idx,
+         obsDtype, probsShape, params, smm_map) = args
         obsN = probsShape[0]
         views = []
         views.append(SharedMemory(smm_map['obs']))
@@ -301,8 +340,8 @@ class EmissionDiscreteMixtureDistribution(EmissionDiscreteDistribution):
 
     @classmethod
     def update_tallies(self, *args):
-        (start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, func, params, smm_map) = args
+        (func, start, end, state_idx, dist_idx, mix_idx,
+         obsDtype, probsShape, params, smm_map) = args
         proporions, _, distribution_indices, mixN = params
         obsN = probsShape[0]
         views = []
@@ -388,8 +427,8 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
 
     @classmethod
     def update_tallies(self, *args):
-        (start, end, node_idx, state_idx, dist_idx, mix_idx, obsDtype,
-         probsShape, obs_indices, func, params, smm_map) = args
+        (func, start, end, node_idx, state_idx, dist_idx, mix_idx, obsDtype,
+         probsShape, obs_indices, params, smm_map) = args
         obsN, num_states, num_nodes  = probsShape
         mu = params['mu']
         sigma = params['sigma']
@@ -405,10 +444,10 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
             for i in range(start, end):
                 s, e = obs_indices[i:i+2]
                 tallies[0] += numpy.sum(
-                    obs[names[dist_idx]][s:e] *
+                    obs[names[dist_idx]][s:e, node_idx] *
                     total[s:e, state_idx, node_idx])
                 tallies[1] += numpy.sum(
-                    (obs[names[dist_idx]][s:e] - mu) ** 2 *
+                    (obs[names[dist_idx]][s:e, node_idx] - mu) ** 2 *
                     total[s:e, state_idx, node_idx])
                 tallies[2] += numpy.sum(
                     total[s:e, state_idx, node_idx])
@@ -447,7 +486,7 @@ class EmissionGaussianDistribution(EmissionContinuousDistribution):
     def generate_emission(self, RNG):
         return RNG.normal(loc=self.mu, scale=self.sigma)
 
-    def get_parameters(self):
+    def get_parameters(self, log=None):
         return {'mu': self.mu, 'sigma':self.sigma}
 
 
@@ -486,8 +525,8 @@ class EmissionLogNormalDistribution(EmissionContinuousDistribution):
 
     @classmethod
     def update_tallies(self, *args):
-        (start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, func, params, smm_map) = args
+        (func, start, end, state_idx, dist_idx, mix_idx,
+         obsDtype, probsShape, params, smm_map) = args
         obsN = probsShape[0]
         views = []
         views.append(SharedMemory(smm_map['obs']))
@@ -573,8 +612,8 @@ class EmissionGammaDistribution(EmissionContinuousDistribution):
 
     @classmethod
     def update_tallies(self, *args):
-        (start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, func, params, smm_map) = args
+        (func, start, end, state_idx, dist_idx, mix_idx,
+         obsDtype, probsShape, params, smm_map) = args
         obsN = probsShape[0]
         views = []
         views.append(SharedMemory(smm_map['obs']))
@@ -647,8 +686,8 @@ class EmissionZeroDistribution(EmissionContinuousDistribution):
 
     @classmethod
     def update_tallies(self, *args):
-        (start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, func, params, smm_map) = args
+        (func, start, end, state_idx, dist_idx, mix_idx,
+         obsDtype, probsShape, params, smm_map) = args
         tallies = numpy.zeros(0, numpy.float64)
         return state_idx, dist_idx, mix_idx, tallies
 
@@ -724,8 +763,8 @@ class EmissionContinuousMixtureDistribution(EmissionContinuousDistribution):
 
     @classmethod
     def update_tallies(self, *args):
-        (start, end, state_idx, dist_idx, mix_idx,
-         obsDtype, probsShape, func, params, smm_map) = args
+        (func, start, end, state_idx, dist_idx, mix_idx,
+         obsDtype, probsShape, params, smm_map) = args
         proportions, _, distribution_indices, mixN = params
         obsN = probsShape[0]
         views = []

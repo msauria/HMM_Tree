@@ -44,9 +44,10 @@ class Node():
             level = 0
         else:
             level = self.level
-        print(f"{level * '  '}{self.name}")
+        output = f"{level * '  '}{self.label}\n"
         for c in self.children:
-            c.print_tree()
+            output += c.print_tree()
+        return output
 
     def find_pairs(self):
         pairs = {}
@@ -57,12 +58,10 @@ class Node():
         return pairs
 
     def initialize_HMM(self,
-                       num_states=2,
                        state_names=None,
                        emissions=None,
                        transition_matrix=None,
                        initial_probabilities=None,
-                       initial_probability_id=None,
                        seed=None):
         self.RNG = numpy.random.default_rng(seed)
         self.num_states = len(emissions)
@@ -90,27 +89,7 @@ class Node():
             for D in self.states[i].distributions:
                 if self.distributions[D.index] is None:
                     self.distributions[D.index] = D
-        if initial_probability_id is None:
-            self.initial_probability_id = numpy.arange(self.num_states,
-                                                       dtype=numpy.int32)
-        else:
-            assert initial_probability_id.shape[0] == self.num_states
-            uids = numpy.unique(initial_probability_id)
-            self.initial_probability_id = numpy.searchsorted(
-                uids, initial_probability_id).astype(numpy.int32)
-        if initial_probabilities is None:
-            probs = self.RNG.random(size=numpy.amax(self.initial_probability_id) + 1)
-            self.initial_probabilities = probs[self.initial_probability_id].astype(numpy.float64)
-        else:
-            initial_probabilities = numpy.copy(initial_probabilities).astype(numpy.float64)
-            assert initial_probabilities.shape[0] == self.num_states
-            self.initial_probabilities = initial_probabilities
-        where = numpy.where(self.initial_probability_id < 0)[0]
-        self.initial_probabilities[where] = 0
-        self.initial_probabilities /= numpy.sum(self.initial_probabilities)
-        self.initial_logprobs = numpy.full(self.num_states, -numpy.inf, numpy.float64)
-        where = numpy.where(self.initial_probabilities > 0)[0]
-        self.initial_logprobs[where] = numpy.log(self.initial_probabilities[where])
+        self.initial_probabilities = initial_probabilities
         self.transitions = transition_matrix
         self.tallies = numpy.zeros(self.num_states, numpy.float64)
         return
@@ -173,17 +152,12 @@ class Node():
         self.initial_probabilities.update_tallies(total[obs_indices[:-1], :, self.index])
         return
 
+
     def apply_tallies(self):
-        where = numpy.where(self.initial_probability_id >= 0)[0]
-        tmp = numpy.bincount(self.initial_probability_id[where],
-                             weights=self.tallies)
-        tmp /= numpy.maximum(numpy.bincount(self.initial_probability_id[where]), 1)
-        self.initial_probabilities.fill(0)
-        self.initial_probabilities[where] = tmp[self.initial_probability_id[where]]
-        self.initial_probabilities /= numpy.sum(self.initial_probabilities)
-        where = numpy.where(self.initial_probabilities > 0)[0]
-        self.initial_logprobs.fill(-numpy.inf)
-        self.initial_logprobs[where] = numpy.log(self.initial_probabilities[where])
+        for S in self.states:
+            S.apply_tallies()
+        self.transitions.apply_tallies()
+        self.initial_probabilities.apply_tallies()
         return
 
     def get_parameters(self):
@@ -233,7 +207,7 @@ class Node():
 
     @classmethod
     def find_probs(self, *args):
-        start, end, obsDtype, probs_shape, treeweight_shape, hmm, smm_map = args
+        start, end, obsDtype, probs_shape, treeweight_shape, node, smm_map = args
         obsN, num_states, num_nodes = probs_shape
         treeseqN, num_states, num_nodes = treeweight_shape
         node_idx = node.index
@@ -285,7 +259,7 @@ class Node():
         probs[tree_seqs[s:e], :, node_idx] += tree_weights[s:e, :, node_idx]
         if obs_mask is not None:
             where = numpy.where(numpy.logical_not(obs_mask[start:end, :]))
-            probs[where[0] + start, where[1], 0] = -numpy.inf
+            probs[where[0] + start, where[1], :] = -numpy.inf
         for V in views:
             V.close()
         return
@@ -293,7 +267,7 @@ class Node():
     @classmethod
     def find_forward(self, *args):
         start, end, obsDtype, probs_shape, obs_indices, node, smm_map = args
-        obsN, num_states, num_nodes = probs_shape[0]
+        obsN, num_states, num_nodes = probs_shape
         node_idx = node.index
         views = []
         views.append(SharedMemory(smm_map['probs']))
@@ -388,10 +362,13 @@ class Node():
         for i in range(start, end):
             s, e = obs_indices[i:i+2]
             tmp = scipy.special.logsumexp(log_total[s, :, node_idx])
-            log_total[s:e, :, node_idx] -= tmp
             obs_scores[i, node_idx, 0] = numpy.sum(scale[s:e, node_idx])
             obs_scores[i, node_idx, 1] = tmp + obs_scores[i, node_idx, 0]
-        total[s:e, :, node_idx] = numpy.exp(log_total[s:e, :, node_idx])
+        s = obs_indices[start]
+        e = obs_indices[end]
+        total[s:e, :, node_idx] = numpy.exp(log_total[s:e, :, node_idx] -
+                                            numpy.amax(log_total[s:e, :, node_idx],
+                                                       axis=1, keepdims=True))
         total[s:e, :, node_idx] /= numpy.sum(total[s:e, :, node_idx], axis=1,
                                              keepdims=True)
         for V in views:
@@ -400,15 +377,21 @@ class Node():
 
     def __str__(self):
         output = []
-        output.append(f"HMM model\n{self.num_states} States")
-        E = f"Emission" + "".join('s' * (self.states[0].num_distributions > 1))
-        output.append(f"{len(self.states[0].distributions)} {E} per Observation")
-        output.append(f"\nInitial Probabilities")
-        tmp = [f"{x:0.3f}" for x in self.initial_probabilities]
+        output.append(f"{self.label} model")
+        output.append(f"Distributions")
+        just = max([len(x.label) for x in self.distributions])
+        for D in self.distributions:
+            tmp = [D.label.rjust(just)] + [f"{name}:{value}" for name, value in
+                               D.get_parameters(log=False).items()]
+            output.append(f'  {" ".join(tmp)}')
+        just2 = max([len(x.label) for x in self.states])
+        output.append("\n\nStates")
+        for S in self.states:
+            tmp = [S.label.rjust(just2)] + [", ".join([x.label.rjust(just) for x in S.distributions])]
+            output.append(f'  {" ".join(tmp)}')
+        output.append(f"\n\nInitial Probabilities")
+        tmp = [f"{x:0.3f}" for x in self.initial_probabilities.initial_probabilities]
         output.append(", ".join(tmp))
-        output.append(f"\nStates")
-        for i in range(self.num_states):
-            output.append(self.states[i].print(1))
         output.append("")
         output.append(self.transitions.print())
         output = "\n".join(output)

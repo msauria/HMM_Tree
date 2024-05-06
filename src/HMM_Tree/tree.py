@@ -3,6 +3,7 @@ import multiprocessing.managers
 import multiprocessing
 from multiprocessing.shared_memory import SharedMemory
 import time
+import copy
 
 import numpy
 import scipy
@@ -47,44 +48,63 @@ class Tree():
             raise ValueError("tree and emissions must be passed if model not " \
                              "being loaded from a file")
         self.load_tree(tree)
-        assert isinstance(type(emissions), list) or isinstance(type(emissions), dict)
-        if isinstance(type(emissions), list):
-            if isinstance(type(emissions[0]), list):
+        assert isinstance(emissions, list) or isinstance(emissions, dict)
+        if isinstance(emissions, list):
+            if isinstance(emissions[0][0], list):
                 self.num_node_states = len(emissions[0])
                 assert len(emissions) == self.nodeN
                 node_emissions = emissions
             else:
-                assert issubclass(type(emissions[0]), EmissionDistribution)
+                assert issubclass(type(emissions[0][0]), EmissionDistribution)
                 self.num_node_states = len(emissions)
                 node_emissions = [copy.deepcopy(emissions) for x in range(self.nodeN)]
         else:
             node_emissions = [emissions[x] for x in self.node_order]
-        node_transitions = TransitionMatrix(transition_matrix, transition_id)
+        node_transitions = TransitionMatrix(transition_matrix=transition_matrix,
+                                            transition_id=transition_id)
         if initial_probabilities is not None:
             node_init_probs = InitialProbability(initial_probabilities=initial_probabilities,
                                                  initial_mapping=initial_probability_id,
-                                                 seed=self.RNG.rand_int(0, 100000000))
+                                                 seed=self.RNG.integers(0, 100000000))
         else:
             node_init_probs = InitialProbability(num_states = self.num_node_states,
-                                                 seed=self.RNG.rand_int(0, 100000000))
+                                                 seed=self.RNG.integers(0, 100000000))
         for i, name in enumerate(self.node_order):
             node = self.nodes[name]
-            node.intialize_HMM(state_names, node_emissions[i], node_init_probs,
-                               node_transitions, self.RNG.rand_int(0, 100000000))
+            node.initialize_HMM(state_names, node_emissions[i], node_transitions,
+                                node_init_probs, self.RNG.integers(0, 100000000))
         self.num_states = len(tree_emissions)
         self.emissions = tree_emissions
         if tree_initial_probabilities is None:
             self.initial_probabilities = InitialProbability(
-                num_states=self.num_states, seed=self.RNG.rand_int(0, 100000000))
+                num_states=self.num_states, seed=self.RNG.integers(0, 100000000))
         else:
             self.initial_probabilities = InitialProbability(
                 initial_probabilities=tree_initial_probabilities)
-        self.transitions = TransitionMatrix(tree_transition_matrix)
+        self.transitions = TransitionMatrix(transition_matrix=tree_transition_matrix)
         self.log_probs = numpy.zeros(self.nodeN + 1, numpy.float64)
         return
 
     def __str__(self):
-        return self.HMM.__str__()
+        output = []
+        output.append(f"Tree model -")
+        output.append(self.root.print_tree())
+        output.append("Emissions")
+        just = max([len(x.label) for x in self.emissions])
+        for D in self.emissions:
+            tmp = [D.label] + [f"{name}:{value}" for name, value in
+                               D.get_parameters(log=False).items()]
+            output.append(f'  {" ".join(tmp)}')
+        output.append(f"\nInitial Probabilities")
+        tmp = [f"{x:0.3f}" for x in self.initial_probabilities.initial_probabilities]
+        output.append(f'  {", ".join(tmp)}')
+        output.append("")
+        output.append(self.transitions.print())
+        output.append("")
+        for name in self.node_order:
+            output.append(self.nodes[name].__str__())
+            output.append('')
+        return "\n".join(output)
 
     @classmethod
     def product(cls, X):
@@ -102,13 +122,15 @@ class Tree():
         else:
             parents = tree
         # Add nodes and connections
+        self.nodes = {}
+        self.node_index = {}
+        self.root = None
         node_order = []
         for c, p in parents.items():
             node_order.append(c)
             if p not in self.nodes and p is not None:
                 self.node_index[p] = len(self.nodes)
                 self.nodes[p] = Node(p, self.node_index[p])
-                self.node_tree[self.node_index[p]] = []
             if c not in self.nodes:
                 self.node_index[c] = len(self.nodes)
                 self.nodes[c] = Node(c, self.node_index[c])
@@ -132,7 +154,7 @@ class Tree():
         # Figure out order to evaluate nodes in
         levels = {}
         for name in node_order:
-            n = self.nodes[name]:
+            n = self.nodes[name]
             l = n.level
             levels.setdefault(l, [])
             levels[l].append(name)
@@ -143,7 +165,7 @@ class Tree():
             order += levels[l]
         self.node_order = order
         self.nodeN = len(self.nodes)
-        self.node_idx_order = numpy.zeros(self.node_order.shape[0], dtype=numpy.int32)
+        self.node_idx_order = numpy.zeros(len(self.node_order), dtype=numpy.int32)
         self.node_parents = {}
         self.node_children = {}
         self.node_pairs = []
@@ -209,26 +231,31 @@ class Tree():
                 self.thread_seq_indices[i] -= 1
         self.make_shared_array(f"obs_scores", (self.num_obs, self.nodeN, 2),
                                numpy.float64)
-        assert numpy.amax(tree_seqs) < self.obs_indices[-1]
-        self.make_shared_array(f"tree_seqs", (tree_seqs.shape[0],), numpy.int32)
-        self.make_shared_array(f"tree_scale", (tree_seqs.shape[0], self.nodeN),
+        all_tree_seqs = numpy.zeros(sum([x.shape[0] for x in tree_seqs]), numpy.int32)
+        pos = 0
+        for i in range(self.num_obs):
+            all_tree_seqs[pos:pos + len(tree_seqs[i])] = self.obs_indices[i] + tree_seqs[i]
+            pos += tree_seqs[i].shape[0]
+        assert numpy.amax(all_tree_seqs) < self.obs_indices[-1]
+        self.make_shared_array(f"tree_seqs", (all_tree_seqs.shape[0],), numpy.int32)
+        self.make_shared_array(f"tree_scale", (all_tree_seqs.shape[0], self.nodeN),
                                numpy.float64)
-        self.make_shared_array(f"tree_scores", (tree_seqs.shape[0], 2),
+        self.make_shared_array(f"tree_scores", (all_tree_seqs.shape[0], 2),
                                numpy.float64)
-        self.tree_seqs[:] = tree_seqs
+        self.tree_seqs[:] = all_tree_seqs
         self.tree_seqN = self.tree_seqs.shape[0]
         self.thread_tree_indices = numpy.round(numpy.linspace(
             0, self.tree_seqN, self.nthreads + 1)).astype(numpy.int32)
         if obs_mask is not None:
             self.make_shared_array(f"obs_mask", (self.obs_indices[-1],
-                                   self.num_states), bool)
+                                   self.num_node_states), bool)
             for i in range(self.num_obs):
                 s, e = self.obs_indices[i:i+2]
                 self.obs_mask[s:e, :] = obs_mask[i].astype(bool)
 
-    def train_model(self, obs=None, obs_mask=None, iterations=100, min_delta=1e-8):
+    def train_model(self, obs=None, tree_seqs=None, obs_mask=None, iterations=100, node_burnin=5, tree_burnin=2, min_delta=1e-8):
         if obs is not None:
-            self.ingest_observations(obs, obs_mask)
+            self.ingest_observations(obs, tree_seqs, obs_mask)
         else:
             assert self.num_obs is not None
         self.make_shared_array(f"dist_probs",
@@ -253,14 +280,21 @@ class Tree():
                                (self.tree_seqN, self.num_states, self.nodeN, 5),
                                numpy.float64)
         self.make_shared_array(f"tree_scale",
-                               (self.nodeN,), numpy.float64)
+                               (self.tree_seqN, self.nodeN,), numpy.float64)
         self.make_shared_array(f"tree_weights",
                                (self.tree_seqN, self.num_node_states, self.nodeN),
                                numpy.float64)
         self.tree_weights[:, :, :] = 0
         prev_prob = 1
+        for i in range(node_burnin):
+            print(f"\r{' '*80}\rNode burnin iteration {i}", file=sys.stderr)
+            self.update_node_models()
+        for i in range(tree_burnin):
+            prob = self.update_tree_model()
+            print(f"\r{' '*80}\rTree burnin iteration {i}: Log-prob {prob: 0.1f}",
+                  file=sys.stderr)
         for i in range(iterations):
-            prob = self.update_model()
+            prob = self.update_models()
             print(f"\r{" "*80}\rIteration {i}: Log-prob {prob: 0.1f}", end='\n',
                   file=sys.stderr)
             #self.plot_params(i)
@@ -271,21 +305,40 @@ class Tree():
         print(f"\r{' ' * 80}\r", end="", file=sys.stderr)
         return
 
-    def update_model(self):
+    def update_models(self):
+        self.update_node_models()
+        return self.update_tree_model()
+
+    def update_node_models(self):
         self.clear_tallies()
-        for node in self.nodes:
+        for node in self.nodes.values():
             self.update_node_model(node)
-        for node in self.nodes:
+        for node in self.nodes.values():
             self.update_node_tallies(node)
         self.apply_node_tallies()
+        return
+
+    def update_tree_model(self):
         self.find_probs()
         self.find_reverse()
         self.find_forward()
         self.find_total()
+
+        # data = {}
+        # data['forward'] = self.forward[self.tree_seqs, :, :]
+        # data['reverse'] = self.reverse[self.tree_seqs, :, :]
+        # data['log_total'] = self.log_total[self.tree_seqs, :, :]
+        # data['total'] = self.total[self.tree_seqs, :, :]
+        # data['probs'] = self.tree_probs
+        # for i in range(len(self.emissions)):
+        #     data[f'emission_{i}'] = self.emissions[i].probabilities
+        # numpy.savez('temp.npz', **data)
+        # raise RuntimeError
+
         self.update_tallies()
         self.apply_tallies()
         self.find_tree_weights()
-        return -self.log_prob[-1]
+        return -self.log_probs[-1]
 
     def generate_sequences(self, num_seqs=1, lengths=100):
         assert self.smm_map is not None, "HmmManager must be used inside a 'with' statement"
@@ -441,9 +494,9 @@ class Tree():
                     params = D.get_parameters()
                     if D.fixed:
                         continue
-                    args.append((s, e, node.index, i, j, None, self.obs.dtype,
-                                 self.probs.shape, self.obs_indices,
-                                 D.update_tallies, params, self.smm_map))
+                    args.append((D.update_tallies, s, e, node.index, i, j, None,
+                                 self.obs.dtype, self.probs.shape,
+                                 self.obs_indices, params, self.smm_map))
         for result in self.pool.starmap(EmissionDistribution.update_tallies, args):
             state_idx, dist_idx, _, tallies = result
             node.states[state_idx].distributions[dist_idx].tallies += tallies
@@ -451,9 +504,6 @@ class Tree():
 
     def apply_node_tallies(self):
         for node in self.nodes.values():
-            for S in node.states:
-                S.apply_tallies()
-            node.transitions.apply_tallies()
             node.apply_tallies()
         return
 
@@ -502,7 +552,8 @@ class Tree():
 
     def update_tallies(self):
         self.log_probs[-1] = numpy.sum(self.tree_scores[:, 1])
-        self.initial_probabilities.update_tallies(self.tree_probs[:, :, 4])
+        self.initial_probabilities.update_tallies(
+            self.tree_probs[:, :, self.root.index, 4])
         self.update_transition_tallies()
         self.update_emission_tallies()
         return
@@ -524,25 +575,23 @@ class Tree():
             for j in range(self.thread_tree_indices.shape[0] - 1):
                 s, e = self.thread_tree_indices[j:j+2]
                 D = self.emissions[j]
-                else:
-                    params = D.get_parameters()
                 if D.fixed:
                     continue
-                args.append((s, e, i, self.total.shape, self.tree_probs.shape,
-                             D.update_tree_tallies, params, self.smm_map))
-        for result in self.pool.starmap(EmissionDistribution.update_tree_tallies, args):
+                else:
+                    params = D.get_parameters()
+                args.append((D.update_tree_tallies, s, e, i, self.total.shape,
+                             self.tree_probs.shape, params, self.smm_map))
+        for result in self.pool.starmap(EmissionDistribution.update_tallies, args):
             state_idx, tallies = result
             self.emissions[state_idx].tallies += tallies
         return
 
     def apply_tallies(self):
         for E in self.emissions:
-            E.apply_tallies()
-        self.transitions.apply_tree_tallies()
-        self.initial_probabilities = self.tallies / numpy.sum(self.tallies)
-        self.log_initprobs.fill(-numpy.inf)
-        where = numpy.where(self.initial_probabilities > 0)[0]
-        self.log_initprobs[where] = numpy.log(self.initial_probabilities[where])
+            if not E.fixed:
+                E.apply_tallies()
+        self.transitions.apply_tallies()
+        self.initial_probabilities.apply_tallies()
         return
 
     def find_tree_weights(self):
@@ -559,15 +608,15 @@ class Tree():
         start, end, total_shape, probs_shape, emissions, smm_map = args
         obsN, num_states, num_nodes, _ = probs_shape
         views = []
-        views.append(SharedMemory(smm_map['total']))
+        views.append(SharedMemory(smm_map['log_total']))
         total = numpy.ndarray(total_shape, numpy.float64, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['tree_probs']))
         probs = numpy.ndarray(probs_shape, numpy.float64, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['tree_seqs']))
         tree_seqs = numpy.ndarray((obsN,), numpy.int32, buffer=views[-1].buf)
         for i in range(num_states):
-            probs[start:end, :, i, 0] = emissions[i].score_observations(
-                total[tree_seqs[start:end], :, :])
+            probs[start:end, i, :, 0] = emissions[i].score_observations(
+                total[tree_seqs, :, :], start=start, end=end)
         for V in views:
             V.close()
         return
@@ -648,6 +697,8 @@ class Tree():
         probs = numpy.ndarray(probs_shape, numpy.float64, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['tree_scores']))
         scores = numpy.ndarray((seqN, 2), numpy.float64, buffer=views[-1].buf)
+        views.append(SharedMemory(smm_map['tree_scale']))
+        scale = numpy.ndarray((seqN, num_nodes), numpy.float64, buffer=views[-1].buf)
         for i in node_order:
             children = node_children[i]
             if len(children) == 0:
@@ -659,13 +710,14 @@ class Tree():
                 probs[s:e, :, i, 3] = probs[s:e, :, i, 2] + numpy.sum(
                     probs[s:e, :, children, 1], axis=2)
         tmp = scipy.special.logsumexp(probs[s:e, :, :, 3], axis=1)
-        probs[s:e, :, :, 3] -= tmp.reshape(-1, 1, num_nodes)
 
-        probs[s:e, :, :, 4] = numpy.exp(probs[s:e, :, :, 3])
+        probs[s:e, :, :, 4] = numpy.exp(probs[s:e, :, :, 3] -
+                                        numpy.amax(probs[s:e, :, :, 3],
+                                                   axis=1, keepdims=True))
         probs[s:e, :, :, 4] /= numpy.sum(probs[s:e, :, :, 4], axis=1,
                                              keepdims=True)
         root = node_order[0]
-        scores[s:e, 0] = numpy.sum(tree_scale[s:e, :], axis=1)
+        scores[s:e, 0] = numpy.sum(scale[s:e, :], axis=1)
         scores[s:e, 1] = numpy.sum(tmp[:, root]) + scores[s:e, 0]
         for V in views:
             V.close()
@@ -675,19 +727,28 @@ class Tree():
     def find_tree_weights_thread(self, *args):
         start, end, probs_shape, emissions, smm_map = args
         seqN, num_tree_states, num_nodes, _ = probs_shape
+        num_node_states = emissions[0].probabilities.shape[0]
         views = []
         views.append(SharedMemory(smm_map['tree_probs']))
         probs = numpy.ndarray(probs_shape, numpy.float64, buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['tree_weights']))
-        tree_weights = numpy.ndarray((seqN, num_node_states), numpy.int32,
-                                     buffer=views[-1].buf)
-        tree_weights[start:end, :].fill(0)
+        tree_weights = numpy.ndarray((seqN, num_node_states, num_nodes),
+                                     numpy.float64, buffer=views[-1].buf)
+        tree_weights[start:end, :, :].fill(0)
         for i in range(num_tree_states):
-            tree_weights[start:end, :] += (tree_probs[start:end, i, :, 4] *
-                                           emissions[i].probabilities.reshape(1, -1))
-        tree_weights[start:end, :] /= numpy.sum(tree_weights[start:end, :],
-                                                axis=1, keepdims=True)
-        tree_weights[start:end, :] = numpy.log(tree_weights[start:end, :])
+            tree_weights[start:end, :, :] += (
+                probs[start:end, i, :, 4].reshape(-1, 1, num_nodes) *
+                emissions[i].probabilities.reshape(1, -1, 1) /
+                numpy.sum(emissions[i].probabilities))
+        # tree_weights[start:end, :, :] = numpy.sum(tree_weights[start:end, :, :],
+        #                                           axis=2, keepdims=True)
+        tree_weights[start:end, :, :] /= numpy.sum(tree_weights[start:end, :, :],
+                                                   axis=1, keepdims=True)
+        where = numpy.where(tree_weights[start:end, :, :] > 0)
+        where2 = numpy.where(tree_weights[start:end, :, :] <= 0)
+        tree_weights[where[0] + start, where[1], where[2]] = numpy.log(
+            tree_weights[where[0] + start, where[1], where[2]])
+        tree_weights[where2[0] + start, where2[1], where2[2]] = -numpy.inf
         for V in views:
             V.close()
         return
@@ -716,8 +777,8 @@ class Tree():
         data['tree_initial_probabilities'] = self.initial_probabilities.initial_probabilities
         data['node_transition_matrix'] = self.root.transitions.transition_matrix
         data['node_transition_id'] = self.root.transitions.transition_id
-        data['node_initial_probabilities'] = self.root.intitial_probabilities.initial_probabilities
-        data['node_initial_id'] = self.root.intitial_probabilities.initial_probability_id
+        data['node_initial_probabilities'] = self.root.initial_probabilities.initial_probabilities
+        data['node_initial_mapping'] = self.root.initial_probabilities.initial_mapping
         dist_map = numpy.zeros(self.root.num_dists * self.num_node_states,
             numpy.dtype([('state', numpy.int32), ('dist', numpy.int32),
                          ('index', numpy.int32)]))
@@ -729,7 +790,8 @@ class Tree():
                 if f"dist_{D.index}" not in data:
                     params = D.get_parameters()
                     dtype = [('name', f'<U{len(D.name)}'),
-                             ('label', f'<U{len(D.label)}')]
+                             ('label', f'<U{len(D.label)}'),
+                             ('fixed', bool)]
                     for name, value in params.items():
                         if (isinstance(type(value), numpy.ndarray) and 
                             (len(value.shape) > 1 or value.shape[0] > 1)):
@@ -740,6 +802,7 @@ class Tree():
                     data[f"dist_{D.index}"] = numpy.zeros(1, dtype=numpy.dtype(dtype))
                     data[f"dist_{D.index}"]['name'] = D.name
                     data[f"dist_{D.index}"]['label'] = D.label
+                    data[f"dist_{D.index}"]['fixed'] = D.fixed
         for i in range(self.num_node_states):
             for nodename in self.node_order:
                 node = self.nodes[nodename]
@@ -749,9 +812,9 @@ class Tree():
                     params = D.get_parameters()
                     for name, value in params.items():
                         if isinstance(type(value), numpy.ndarray):
-                            data[key][name][:, node_idx] = value
+                            data[key][name][0, :, node_idx] = value
                         else:
-                            data[key][name][node_idx] = value
+                            data[key][name][0, node_idx] = value
         data['distribution_mapping'] = dist_map
         state_names = [self.root.states[x].label for x in range(self.num_node_states)]
         data['node_state_names'] = numpy.array(
@@ -763,13 +826,13 @@ class Tree():
         data['node_names'] = numpy.array(
             node_names, f"<U{max([len(x) for x in node_names])}")
         state_names = [self.emissions[x].label for x in range(len(self.emissions))]
-        data['tree_state_names'] = numpy.array(
-            state_names, f"<U{max([len(x) for x in state_names])}")
-        data['tree_emissions'] = numpy.zeros((self.emissions[0].probabilities.shape[0],
-                                              self.num_states), numpy.float64)
+        data['tree_emissions'] = numpy.zeros(len(self.emissions), dtype=numpy.dtype([
+            ('label', f'<U{max([len(x) for x in state_names])}'), ('fixed', bool),
+            ('probabilities', numpy.float64, (self.emissions[0].probabilities.shape[0],))]))
         for i, E in enumerate(self.emissions):
-            data['tree_emissions'][:, i] = E.probabilities
-        pairs = list(self.root.find_pairs().items())
+            data['tree_emissions'][i] = (E.label, E.fixed, E.probabilities)
+        pairs = [(self.root.label, '')] + [(child, self.nodes[child].parent_name)
+                                           for child in self.node_order[1:]]
         maxlen = max([len(x[0]) for x in pairs] + [len(x[1]) for x in pairs])
         data['tree'] = numpy.array(pairs, f"<U{maxlen}")
         numpy.savez(fname, **data)
@@ -782,15 +845,18 @@ class Tree():
         node_transition_id = temp['node_transition_id']
         tree_initial_probabilities = temp['tree_initial_probabilities']
         node_initial_probabilities = temp['node_initial_probabilities']
-        node_initial_probability_id = temp['node_initial_probability_id']
-        tree_state_names = temp['tree_state_names']
+        node_initial_mapping = temp['node_initial_mapping']
         node_state_names = temp['node_state_names']
         node_names = temp['node_names']
         tree = {x[0]: x[1] for x in temp['tree']}
-        tree_num_states = temp['tree_emissions'].shape[0]
-        tree_emissions = [EmissionAlphabetDistribution(temp['tree_emissions'][x, :],
-                                                       label=tree_state_names[x])
-                          for x in range(tree_num_states)]
+        for key in tree.keys():
+            if tree[key] == '':
+                tree[key] = None
+        tree_E = temp['tree_emissions']
+        tree_num_states = tree_E.shape[0]
+        tree_emissions = [EmissionSummingDistribution(
+            tree_E['probabilities'][x], label=tree_E['label'][x],
+            fixed=tree_E['fixed'][x]) for x in range(tree_num_states)]
         dist_map = temp['distribution_mapping']
         distributions = {}
         node_num_states = len(node_state_names)
@@ -816,15 +882,17 @@ class Tree():
                         dname = temp[name][name2][0]
                     elif name2 == 'label':
                         label = temp[name][name2][0]
+                    elif name2 == 'fixed':
+                        fixed = temp[name][name2][0]
                     else:
-                        if temp[name][name2].size == 1:
-                            params[name2] = temp[name][name2][j]
+                        if len(temp[name][name2].shape) == 2:
+                            params[name2] = temp[name][name2][0, j]
                         else:
-                            params[name2] = temp[name][name2][:, j]
+                            params[name2] = temp[name][name2][0, :, j]
                 if dname == "Zero":
-                    distributions[name] = dists[dname]()
+                    distributions[f"{name}_{j}"] = dists[dname]()
                 elif not dname.endswith("Mixture"):
-                    distributions[name] = dists[dname](**params)
+                    distributions[f"{name}_{j}"] = dists[dname](**params)
                 # else:
                 #     index = numpy.where(dist_map['index'] == int(name.split('_')[-1]))[0][0]
                 #     indices = dist_map['index'][numpy.where(numpy.logical_and(numpy.logical_and(
@@ -835,29 +903,29 @@ class Tree():
                 #         [mixdistributions[f"mixdist_{x}"] for x in indices],
                 #         **params)
                 distributions[f"{name}_{j}"].label = label
+                distributions[f"{name}_{j}"].fixed = fixed
         emissions = [[[None for y in range(numpy.amax(dist_map['dist']) + 1)]
                      for x in range(node_num_states)] for z in range(num_nodes)]
         for i in range(num_nodes):
-            for s_idx, d_idx, m_idx, idx in dist_map:
-                if m_idx == -1:
-                    emissions[i][s_idx][d_idx] = distributions[f"dist_{idx}_{i}"]
+            for s_idx, d_idx, idx in dist_map:
+                emissions[i][s_idx][d_idx] = distributions[f"dist_{idx}_{i}"]
         self.load_tree(tree)
         self.num_node_states = node_num_states
-        node_transitions = TransitionMatrix(node_transition_matrix, node_transition_id)
+        node_transitions = TransitionMatrix(transition_matrix=node_transition_matrix,
+                                            transition_id=node_transition_id)
         node_init_probs = InitialProbability(initial_probabilities=node_initial_probabilities,
-                                             initial_mapping=node_initial_probability_id)
+                                             initial_mapping=node_initial_mapping)
         for i, name in enumerate(self.node_order):
             node = self.nodes[name]
-            node.intialize_HMM(node_state_names, emissions[i], node_init_probs,
-                               node_transitions)
+            node.initialize_HMM(node_state_names, emissions[i],
+                                node_transitions, node_init_probs)
         self.num_states = tree_num_states
         self.emissions = tree_emissions
         self.initial_probabilities = InitialProbability(
             initial_probabilities=tree_initial_probabilities)
-        self.transitions = TransitionMatrix(tree_transition_matrix)
+        self.transitions = TransitionMatrix(transition_matrix=tree_transition_matrix)
         self.log_probs = numpy.zeros(self.nodeN + 1, numpy.float64)
         return
-
 
 
 

@@ -61,16 +61,15 @@ class TransitionMatrix():
         views.append(SharedMemory(smm_map['reverse']))
         reverse = numpy.ndarray(probsShape, dtype=numpy.float64,
                                 buffer=views[-1].buf)
-        views.append(SharedMemory(smm_map['scale']))
-        scale = numpy.ndarray((obsN, num_nodes), dtype=numpy.float64,
-                              buffer=views[-1].buf)
         tallies = numpy.zeros(valid_trans[0].shape[0], numpy.float64)
         for i in range(start, end):
             s, e = obs_indices[i:i+2]
-            xi = numpy.exp(forward[s:e - 1, valid_trans[0], idx] +
-                           reverse[s + 1:e, valid_trans[1], idx] +
-                           probs[s + 1:e, valid_trans[1], idx] +
-                           transitions.reshape(1, -1) + scale[s + 1:e, idx])
+            xi = (forward[s:e - 1, valid_trans[0], idx] +
+                 reverse[s + 1:e, valid_trans[1], idx] +
+                 probs[s + 1:e, valid_trans[1], idx] +
+                 transitions.reshape(1, -1))
+            xi -= numpy.amax(xi, axis=1, keepdims=True)
+            xi = numpy.exp(xi)
             xi /= numpy.sum(xi, axis=1, keepdims=True)
             tallies += numpy.sum(xi, axis=0)
         for V in views:
@@ -80,13 +79,13 @@ class TransitionMatrix():
     @classmethod
     def update_tree_tallies(self, *args):
         s, e, pairs, node_children, probsShape, transitions, smm_map = args
-        seqN, stateN, num_nodes, _ = probsShape[:2]
+        seqN, num_states, num_nodes, _ = probsShape
         views = []
         views.append(SharedMemory(smm_map['tree_probs']))
         probs = numpy.ndarray(probsShape, dtype=numpy.float64,
                               buffer=views[-1].buf)
         views.append(SharedMemory(smm_map['tree_scale']))
-        scale = numpy.ndarray(obsN, dtype=numpy.float64,
+        scale = numpy.ndarray((seqN, num_nodes), dtype=numpy.float64,
                               buffer=views[-1].buf)
         tallies = numpy.zeros((num_states, num_states), numpy.float64)
         for idx1, idx2 in pairs:
@@ -97,7 +96,7 @@ class TransitionMatrix():
                 reverse = (probs[s:e, :, idx2, 0] - scale[s:e, idx2] +
                            probs[s:e, :, children[0], 1])
             else:
-                reverse = (probs[s:e, :, idx2, 0] - scale[s:e, idx2] +
+                reverse = (probs[s:e, :, idx2, 0] - scale[s:e, idx2].reshape(-1, 1) +
                            numpy.sum(probs[s:e, :, children, 1], axis=2))
             xi = numpy.exp(probs[s:e, :, idx1, 2].reshape(-1, num_states, 1) +
                            reverse.reshape(-1, 1, num_states) +
@@ -106,7 +105,7 @@ class TransitionMatrix():
             tallies += numpy.sum(xi, axis=0)
         for V in views:
             V.close()
-        return tallies
+        return tallies.reshape(-1)
 
     def apply_tallies(self):
         if self.updated:
@@ -131,7 +130,7 @@ class TransitionMatrix():
         if self.updated:
             return
         self.updated = True
-        self.transition_matrix[:, :] = tallies
+        self.transition_matrix[:, :] = self.tallies
         self.transition_matrix /= numpy.sum(self.transition_matrix, axis=1,
                                             keepdims=True)
         where = numpy.where(self.transition_matrix > 0)
